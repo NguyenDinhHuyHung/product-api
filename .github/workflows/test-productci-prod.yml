@@ -1,0 +1,125 @@
+name: Product CI Production Test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  product-api-test:
+    runs-on: ubuntu-latest
+
+    services:
+      mongodb:
+        image: mongo:8
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      PORT: 3000
+      MONGO_URI: mongodb://localhost:27017/productdb
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check JavaScript syntax
+        run: |
+          node --check src/app.js
+          node --check src/models/Product.js
+          node --check src/controllers/productController.js
+          node --check src/routes/productRoutes.js
+
+      - name: Start Product API
+        run: |
+          npm start > product-api.log 2>&1 &
+          echo $! > product-api.pid
+
+      - name: Wait for Product API
+        run: |
+          for i in {1..30}; do
+            if curl --fail http://localhost:3000/health; then
+              echo ""
+              echo "Product API is healthy"
+              exit 0
+            fi
+
+            echo "Waiting for Product API..."
+            sleep 2
+          done
+
+          echo "Product API failed to start"
+          cat product-api.log
+          exit 1
+
+      - name: Test CREATE Product
+        run: |
+          RESPONSE=$(curl --fail \
+            -X POST http://localhost:3000/api/products \
+            -H "Content-Type: application/json" \
+            -d '{"pid":"P001","pname":"Laptop","price":15000000,"quantity":10}')
+
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep '"pid":"P001"'
+          echo "$RESPONSE" | grep '"pname":"Laptop"'
+
+      - name: Test READ Product
+        run: |
+          RESPONSE=$(curl --fail \
+            http://localhost:3000/api/products/P001)
+
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep '"pid":"P001"'
+          echo "$RESPONSE" | grep '"quantity":10'
+
+      - name: Test UPDATE Product
+        run: |
+          RESPONSE=$(curl --fail \
+            -X PUT http://localhost:3000/api/products/P001 \
+            -H "Content-Type: application/json" \
+            -d '{"pname":"Laptop Updated","price":16000000,"quantity":20}')
+
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep '"pname":"Laptop Updated"'
+          echo "$RESPONSE" | grep '"price":16000000'
+          echo "$RESPONSE" | grep '"quantity":20'
+
+      - name: Test DELETE Product
+        run: |
+          RESPONSE=$(curl --fail \
+            -X DELETE http://localhost:3000/api/products/P001)
+
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep '"message":"Product deleted successfully"'
+
+      - name: Verify Product Deleted
+        run: |
+          STATUS=$(curl \
+            -s \
+            -o response.json \
+            -w "%{http_code}" \
+            http://localhost:3000/api/products/P001)
+
+          cat response.json
+          test "$STATUS" = "404"
+          grep '"message":"Product not found"' response.json
+
+      - name: Build Docker image
+        run: docker build -t product-api:test .
